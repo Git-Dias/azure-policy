@@ -1,0 +1,375 @@
+- Todo bloqueio gera no Activity Log o evento `Microsoft.Authorization/policies/deny/action` (categoria **Policy**).
+- O evento fica na **subscription onde o deploy foi tentado**, independente do escopo do assignment (RG, Sub, MG ou Tenant Root).
+---
+
+|Item|Valor usado|
+|---|---|
+|Região|`brazilsouth`|
+|Resource group de logs|`rg-security-logging`|
+|Log Analytics workspace|`law-security`|
+|Diagnostic setting (lab)|`ds-activity-to-law`|
+|Função KQL|`DenySecPolicies`|
+|RG de testes|`rg-denytest`|
+
+---
+
+## 1. Criar o workspace
+
+- [ ] **Log Analytics workspaces → + Create**
+- [ ] · RG: `rg-security-logging` · Nome: `law-security` · Região: Brazil South
+- [ ] **Review + create**
+
+---
+
+## 2. Enviar o Activity Log para o workspace
+
+Categorias: **Policy** (obrigatória) · **Administrative** (recomendada, traz request body e criação de exemptions). Custo zero: `AzureActivity` não cobra ingestão e tem 90 dias grátis.
+
+### 2.1. Lab (uma subscription)
+
+- [ ] **Monitor → Activity log → Export Activity Logs** → **+ Add diagnostic setting**
+- [ ] Nome: `ds-activity-to-law`
+- [ ] Logs: ✅ Policy · ✅ Administrative
+- [ ] Destino: ✅ Send to Log Analytics workspace → `law-security`
+- [ ] Eventos anteriores não são reenviados)
+
+### 2.2. Produção (todas as subscriptions)
+
+- [ ] **Policy → Definitions** → buscar _"Configure Azure Activity logs to stream to specified Log Analytics workspace"_ → **Assign policy**
+- [ ] **Basics:** Scope = **Tenant Root Group** · Name = `Route Activity Log to law-security` · Enforcement = Enabled
+- [ ] **Parameters** (desmarcar _Only show parameters that need input_): workspace = `law-security` · Enable logs = True
+- [ ] **Remediation:** ✅ Create a remediation task · System assigned identity · Location = Brazil South
+- [ ] **Review + create**
+- [ ] Acompanhar em **Policy → Remediation → Remediation tasks**
+- [ ] Máx. 5 diagnostic settings por subscription · não criar duas settings com a mesma categoria para o mesmo workspace (erro _Data sinks can't be reused_).
+
+---
+
+## 3. Validar a ingestão
+
+- [ ] Gerar qualquer atividade e aguardar 15–30 min
+- [ ] Rodar em `law-security` → **Logs**:
+
+```kusto
+AzureActivity
+| where TimeGenerated > ago(3h)
+| summarize Events = count(), LastEvent = max(TimeGenerated) by CategoryValue
+```
+
+```kusto
+AzureActivity
+| where TimeGenerated > ago(24h)
+| where ResourceGroup =~ "rg-denytest" or OperationNameValue has "deny"
+| project TimeGenerated, CategoryValue, OperationNameValue, ActivityStatusValue,
+          Resource = tostring(Properties_d.resource)
+| order by TimeGenerated desc
+```
+
+Resultado esperado: linhas **Policy** e **Administrative** com `LastEvent` recente.
+
+- [ ] Subscriptions que não enviaram dados nos últimos 7 dias (se vazio = OK):
+
+```kusto
+arg("").ResourceContainers
+| where type == "microsoft.resources/subscriptions"
+| project SubscriptionId = tolower(subscriptionId), SubscriptionName = name
+| join kind=leftanti hint.remote=right (
+    AzureActivity
+    | where TimeGenerated > ago(7d)
+    | distinct SubscriptionId = tolower(SubscriptionId)
+  ) on SubscriptionId
+```
+
+---
+
+## 4. Criar a função `DenySecPolicies`
+
+- [ ] `law-security` → **Logs** → colar a query → **Save → Save as function** → Nome `DenySecPolicies` · Categoria `Security`
+- [ ] Testar: `DenySecPolicies | where TimeGenerated > ago(1d) | take 10`
+
+### 4.1. Com nome da subscription
+
+```kusto
+AzureActivity
+| where OperationNameValue =~ "Microsoft.Authorization/policies/deny/action"
+| extend p = parse_json(tostring(Properties_d.policies))
+| mv-expand p
+| extend AssignmentScope = tolower(tostring(p.policyAssignmentScope))
+| project
+    DateTime       = datetime_utc_to_local(TimeGenerated, "America/Sao_Paulo"),
+    TimeGenerated,
+    SubscriptionId = tolower(SubscriptionId),
+    SubscriptionMG = tostring(split(tostring(Properties_d.ancestors), ",")[0]),
+    ResourceGroup  = tolower(ResourceGroup),
+    Resource       = tostring(Properties_d.resource),
+    ResourceType   = tostring(Properties_d.resourceProviderValue),
+    Location       = tostring(Properties_d.resourceLocation),
+    Initiative     = coalesce(tostring(p.policySetDefinitionDisplayName), "(standalone policy)"),
+    Policy         = tostring(p.policyDefinitionDisplayName),
+    Assignment     = tostring(p.policyAssignmentDisplayName),
+    AssignmentName = tostring(p.policyAssignmentName),
+    AssignmentMG   = extract(@"managementgroups/([^/]+)", 1, AssignmentScope),
+    AssignmentScope,
+    Caller,
+    CallerIpAddress,
+    CorrelationId
+| join kind=leftouter hint.remote=left (
+    arg("").ResourceContainers
+    | where type == "microsoft.resources/subscriptions"
+    | project SubscriptionId = tolower(subscriptionId), SubscriptionName = name
+  ) on SubscriptionId
+| project-away SubscriptionId1
+| project-reorder DateTime, SubscriptionName, SubscriptionId
+```
+
+### 4.2. Sem nome da subscription (sem `arg()`)
+
+Usar quando o `arg()` não estiver disponível ou quem consulta não tiver Reader nas subscriptions. A coluna `SubscriptionName` recebe o ID para manter as consultas compatíveis.
+
+```kusto
+AzureActivity
+| where OperationNameValue =~ "Microsoft.Authorization/policies/deny/action"
+| extend p = parse_json(tostring(Properties_d.policies))
+| mv-expand p
+| extend AssignmentScope = tolower(tostring(p.policyAssignmentScope))
+| project
+    DateTime       = datetime_utc_to_local(TimeGenerated, "America/Sao_Paulo"),
+    TimeGenerated,
+    SubscriptionId = tolower(SubscriptionId),
+    SubscriptionMG = tostring(split(tostring(Properties_d.ancestors), ",")[0]),
+    ResourceGroup  = tolower(ResourceGroup),
+    Resource       = tostring(Properties_d.resource),
+    ResourceType   = tostring(Properties_d.resourceProviderValue),
+    Location       = tostring(Properties_d.resourceLocation),
+    Initiative     = coalesce(tostring(p.policySetDefinitionDisplayName), "(standalone policy)"),
+    Policy         = tostring(p.policyDefinitionDisplayName),
+    Assignment     = tostring(p.policyAssignmentDisplayName),
+    AssignmentName = tostring(p.policyAssignmentName),
+    AssignmentMG   = extract(@"managementgroups/([^/]+)", 1, AssignmentScope),
+    AssignmentScope,
+    Caller,
+    CallerIpAddress,
+    CorrelationId
+| extend SubscriptionName = SubscriptionId   // sem arg(): usa o ID no lugar do nome
+| project-reorder DateTime, SubscriptionName, SubscriptionId
+```
+
+Regras de uso:
+
+- Uma linha **por policy** que bloqueou → contar deploys com `dcount(CorrelationId)`.
+- Excluir assignments da plataforma: `| where not(AssignmentName startswith "sys.")`.
+
+---
+
+## 5. Salvar as consultas de relatório
+
+Para cada uma: colar → **Save → Save as query**.
+
+**Deny – detalhe**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(7d)
+| project DateTime, SubscriptionName, SubscriptionId, ResourceGroup, Resource, ResourceType,
+          Initiative, Policy, Assignment, AssignmentMG, Caller, CallerIpAddress, CorrelationId
+| order by DateTime desc
+```
+
+**Deny – um registro por deploy bloqueado**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(7d)
+| summarize Policies = make_set(Policy), Initiatives = make_set(Initiative)
+    by DateTime, SubscriptionName, SubscriptionId, ResourceGroup, Resource, Caller, CorrelationId
+| order by DateTime desc
+```
+
+**Deny – por iniciativa**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(30d)
+| summarize BlockedDeployments = dcount(CorrelationId), Subscriptions = dcount(SubscriptionId)
+    by Initiative, AssignmentMG
+| order by BlockedDeployments desc
+```
+
+**Deny – top 20 policies**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(30d)
+| summarize BlockedDeployments = dcount(CorrelationId) by Initiative, Policy
+| top 20 by BlockedDeployments
+```
+
+**Deny – por subscription**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(30d)
+| summarize BlockedDeployments = dcount(CorrelationId) by SubscriptionMG, SubscriptionName, SubscriptionId
+| order by BlockedDeployments desc
+```
+
+**Deny – por subscription e policy**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(30d)
+| summarize BlockedDeployments = dcount(CorrelationId) by SubscriptionName, Initiative, Policy
+| order by SubscriptionName asc, BlockedDeployments desc
+```
+
+**Deny – top callers**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(30d)
+| summarize BlockedDeployments = dcount(CorrelationId), Subscriptions = make_set(SubscriptionName, 10),
+            Policies = make_set(Policy, 10) by Caller
+| top 20 by BlockedDeployments
+```
+
+**Deny – tendência semanal**
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(90d)
+| summarize BlockedDeployments = dcount(CorrelationId) by bin(TimeGenerated, 7d), Initiative
+| render timechart
+```
+
+---
+
+## 6. Gerar eventos de deny
+
+### 6.1. Bash
+
+```bash
+S=$RANDOM
+az group create -n rg-denytest -l brazilsouth
+
+# 00 Controle (deve ser CRIADO)
+az storage account create -g rg-denytest -n stdtok$S -l brazilsouth --sku Standard_LRS \
+  --https-only true --allow-blob-public-access false --allow-shared-key-access false
+
+# 01 Allowed locations
+az storage account create -g rg-denytest -n stdtloc$S -l eastus --sku Standard_LRS \
+  --https-only true --allow-blob-public-access false --allow-shared-key-access false
+
+# 02 Secure transfer
+az storage account create -g rg-denytest -n stdthttp$S -l brazilsouth --sku Standard_LRS \
+  --https-only false --allow-blob-public-access false --allow-shared-key-access false
+
+# 03 Public access
+az storage account create -g rg-denytest -n stdtpub$S -l brazilsouth --sku Standard_LRS \
+  --https-only true --allow-blob-public-access true --allow-shared-key-access false
+
+# 04 Shared key access
+az storage account create -g rg-denytest -n stdtkey$S -l brazilsouth --sku Standard_LRS \
+  --https-only true --allow-blob-public-access false --allow-shared-key-access true
+
+# 05 As quatro violações em uma requisição (1 evento, 4 policies)
+az storage account create -g rg-denytest -n stdtall$S -l eastus --sku Standard_LRS \
+  --https-only false --allow-blob-public-access true --allow-shared-key-access true
+
+# 06 Update de recurso existente
+az storage account update -g rg-denytest -n stdtok$S --https-only false
+
+# 07 Event Hubs TLS 1.0
+az eventhubs namespace create -g rg-denytest -n ehdt$S -l brazilsouth --sku Basic --minimum-tls-version 1.0
+
+# 08 Service Bus TLS 1.0
+az servicebus namespace create -g rg-denytest -n sbdt$S -l brazilsouth --sku Basic --min-tls 1.0
+
+# 09 IoT Hub TLS 1.0
+az iot hub create -g rg-denytest -n iotdt$S -l brazilsouth --sku F1 --partition-count 2 --min-tls-version 1.0
+
+# 10 VM sem CMK nos discos
+az vm create -g rg-denytest -n vmdt$S -l brazilsouth --image Ubuntu2204 --size Standard_B1s \
+  --admin-username azureuser --generate-ssh-keys --public-ip-address '""' --nsg '""'
+```
+
+### 6.2. PowerShell
+
+```powershell
+$S = Get-Random -Minimum 10000 -Maximum 99999
+az group create -n rg-denytest -l brazilsouth
+
+# 00 Controle
+az storage account create -g rg-denytest -n "stdtok$S" -l brazilsouth --sku Standard_LRS --https-only true --allow-blob-public-access false --allow-shared-key-access false
+# 01 Allowed locations
+az storage account create -g rg-denytest -n "stdtloc$S" -l eastus --sku Standard_LRS --https-only true --allow-blob-public-access false --allow-shared-key-access false
+# 02 Secure transfer
+az storage account create -g rg-denytest -n "stdthttp$S" -l brazilsouth --sku Standard_LRS --https-only false --allow-blob-public-access false --allow-shared-key-access false
+# 03 Public access
+az storage account create -g rg-denytest -n "stdtpub$S" -l brazilsouth --sku Standard_LRS --https-only true --allow-blob-public-access true --allow-shared-key-access false
+# 04 Shared key access
+az storage account create -g rg-denytest -n "stdtkey$S" -l brazilsouth --sku Standard_LRS --https-only true --allow-blob-public-access false --allow-shared-key-access true
+# 05 As quatro violações
+az storage account create -g rg-denytest -n "stdtall$S" -l eastus --sku Standard_LRS --https-only false --allow-blob-public-access true --allow-shared-key-access true
+# 06 Update
+az storage account update -g rg-denytest -n "stdtok$S" --https-only false
+# 07 Event Hubs TLS 1.0
+az eventhubs namespace create -g rg-denytest -n "ehdt$S" -l brazilsouth --sku Basic --minimum-tls-version 1.0
+# 08 Service Bus TLS 1.0
+az servicebus namespace create -g rg-denytest -n "sbdt$S" -l brazilsouth --sku Basic --min-tls 1.0
+# 09 IoT Hub TLS 1.0
+az iot hub create -g rg-denytest -n "iotdt$S" -l brazilsouth --sku F1 --partition-count 2 --min-tls-version 1.0
+# 10 VM sem CMK
+az vm create -g rg-denytest -n "vmdt$S" -l brazilsouth --image Ubuntu2204 --size Standard_B1s --admin-username azureuser --generate-ssh-keys --public-ip-address '""' --nsg '""'
+```
+
+Para mais volume: gerar novo `S` / `$S` e repetir 01–10.
+
+---
+
+## 7. Verificar
+
+- [ ] **Na hora:** Monitor → Activity log → filtro _Event category = Policy_, ou:
+
+```bash
+az monitor activity-log list --offset 1h \
+  --query "[?operationName.value=='Microsoft.Authorization/policies/deny/action'].{time:eventTimestamp, resource:resourceId}" -o table
+```
+
+- [ ] **Após 5–15 min** em `law-security`:
+
+```kusto
+DenySecPolicies
+| where TimeGenerated > ago(1h)
+| summarize BlockedDeployments = dcount(CorrelationId) by Policy
+| order by BlockedDeployments desc
+```
+
+---
+
+## 9. Publicar
+
+**Workbook**
+
+- [ ] **Monitor → Workbooks → + New**
+- [ ] Adicionar parâmetro **Time range**
+- [ ] Adicionar um query step para cada consulta da etapa 6
+- [ ] Salvar em `rg-security-logging`
+
+**Exportação semanal (Logic App)**
+
+- [ ] Trigger **Recurrence**: semanal, segunda 08:00, _E. South America Standard Time_
+- [ ] Ação **Azure Monitor Logs → Run query and list results** (`law-security`) com a query abaixo
+- [ ] Ação **Create CSV table**
+- [ ] Ação **SharePoint/OneDrive → Create file**: `policy-denies_<yyyy-MM-dd>.csv` (biblioteca restrita)
+
+```kusto
+let weekStart = startofweek(now()) - 7d;
+let weekEnd   = startofweek(now());
+DenySecPolicies
+| where TimeGenerated >= weekStart and TimeGenerated < weekEnd
+| project DateTime, SubscriptionName, SubscriptionId, ResourceGroup, Resource, ResourceType,
+          Initiative, Policy, Assignment, AssignmentMG, Caller, CorrelationId
+| order by DateTime desc
+```
+
+---
