@@ -1,23 +1,31 @@
 <#
-.SYNOPSIS
-  Exports Azure Policy deny events from all subscriptions you can read, using your own Cloud Shell login.
-
 .EXAMPLES
-  ./Export-PolicyDenies.ps1                                  # last 7 full days, one row per blocked deployment
-  ./Export-PolicyDenies.ps1 -Days 30 -Granularity Resource   # last 30 days, one row per blocked resource
-  ./Export-PolicyDenies.ps1 -Days 1 -IncludeToday            # yesterday + today up to now
+  ./Export-PolicyDenies.ps1 -TenantId <tenant-guid>
+  ./Export-PolicyDenies.ps1 -TenantId <tenant-guid> -Days 30 -Granularity Resource
+  ./Export-PolicyDenies.ps1 -TenantId <tenant-guid> -Days 7 -MaskUserCallers
 #>
+
 param(
+    [ValidatePattern('^[0-9a-fA-F-]{36}$')]
+    [string]$TenantId,
+
     [ValidateRange(1, 90)]
     [int]$Days = 7,
 
     [ValidateSet("Deployment", "Resource")]
     [string]$Granularity = "Deployment",
 
-    [switch]$IncludeToday
+    [switch]$IncludeToday,
+
+    # Replace user UPNs with a pseudonym (service principal names are kept)
+    [switch]$MaskUserCallers,
+
+    [ValidateScript({ Test-Path $_ -PathType Container })]
+    [string]$OutputPath
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptVersion = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Known service principals (pipelines, automations). Add as you find them:
@@ -29,11 +37,18 @@ $knownCallers = @{
 }
 
 # ---------------------------------------------------------------------------
-# Login / tenant
+# Login / tenant pinning
 # ---------------------------------------------------------------------------
 $ctx = Get-AzContext
-if (-not $ctx) { Connect-AzAccount | Out-Null; $ctx = Get-AzContext }
-$tenantId = $ctx.Tenant.Id
+if (-not $ctx) {
+    if ($TenantId) { Connect-AzAccount -Tenant $TenantId | Out-Null } else { Connect-AzAccount | Out-Null }
+    $ctx = Get-AzContext
+}
+if ($TenantId -and $ctx.Tenant.Id -ne $TenantId) {
+    throw "Current context is tenant '$($ctx.Tenant.Id)', expected '$TenantId'. Run: Connect-AzAccount -Tenant $TenantId"
+}
+$tenant = $ctx.Tenant.Id
+$runBy  = $ctx.Account.Id
 
 # ---------------------------------------------------------------------------
 # Time window and time zone (Brasília, fixed UTC-3 since 2019)
@@ -53,6 +68,7 @@ if (-not $tz) { $tz = [TimeZoneInfo]::CreateCustomTimeZone("BRT", [TimeSpan]::Fr
 # Helpers
 # ---------------------------------------------------------------------------
 $script:nameCache = @{}
+$script:maskSalt  = [Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(16))
 
 function Get-ResourceType([string]$ResourceId) {
     $tail = ($ResourceId -split '/providers/')[-1] -split '/'
@@ -61,8 +77,16 @@ function Get-ResourceType([string]$ResourceId) {
     "$($tail[0])/$($types -join '/')"
 }
 
+# Pseudonym for user UPNs: consistent within one run, salted so it can't be reversed with a list of employees
+function Protect-Caller([string]$Name) {
+    if (-not $MaskUserCallers -or $Name -notlike '*@*') { return $Name }
+    $bytes = [Text.Encoding]::UTF8.GetBytes("$($script:maskSalt)|$($Name.ToLowerInvariant())")
+    "user-" + [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).Substring(0, 10).ToLowerInvariant()
+}
+
 function Get-CallerName([string]$Caller) {
-    if ([string]::IsNullOrEmpty($Caller) -or $Caller -like '*@*') { return $Caller }   # users already come as UPN
+    if ([string]::IsNullOrEmpty($Caller)) { return $Caller }
+    if ($Caller -like '*@*') { return (Protect-Caller $Caller) }                 # users come as UPN
     if ($knownCallers.ContainsKey($Caller)) { return $knownCallers[$Caller] }
     if ($script:nameCache.ContainsKey($Caller)) { return $script:nameCache[$Caller] }
 
@@ -78,18 +102,36 @@ function Get-CallerName([string]$Caller) {
     $name
 }
 
-# GET with retry for throttling (429) and transient errors
+# Read-only GET with retry (honors Retry-After) and host validation
 function Invoke-ArmGet {
     param([string]$Path, [string]$Uri)
+
+    if ($Uri) {
+        $u = [uri]$Uri
+        if ($u.Scheme -ne 'https' -or $u.Host -ne 'management.azure.com') {
+            throw "Refusing to follow unexpected URL host '$($u.Host)'"     # never send the token elsewhere
+        }
+    }
+
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         $resp = if ($Uri) { Invoke-AzRestMethod -Method GET -Uri $Uri } else { Invoke-AzRestMethod -Method GET -Path $Path }
         if ($resp.StatusCode -eq 200) { return $resp }
+
         if ($resp.StatusCode -in 429, 500, 502, 503, 504) {
-            Write-Host "    HTTP $($resp.StatusCode) - retry $attempt in $(10 * $attempt)s" -ForegroundColor Yellow
-            Start-Sleep -Seconds (10 * $attempt)
+            $delay = 10 * $attempt
+            try {
+                $ra = $resp.Headers.RetryAfter
+                if ($ra -and $ra.Delta) { $delay = [math]::Max($delay, [int][math]::Ceiling($ra.Delta.TotalSeconds)) }
+            } catch { }
+            $delay += Get-Random -Minimum 0 -Maximum 3
+            Write-Host "    HTTP $($resp.StatusCode) - retry $attempt in ${delay}s" -ForegroundColor Yellow
+            Start-Sleep -Seconds $delay
             continue
         }
-        throw "HTTP $($resp.StatusCode): $($resp.Content)"
+
+        $msg = "$($resp.Content)"
+        if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) + "..." }
+        throw "HTTP $($resp.StatusCode): $msg"
     }
     throw "HTTP $($resp.StatusCode) after 5 attempts"
 }
@@ -98,15 +140,27 @@ function Join-Unique($Values) {
     (@($Values -split '; ' | Where-Object { $_ } | Select-Object -Unique) -join '; ')
 }
 
+# CSV/formula injection protection (OWASP): prefix cells starting with = + - @ tab CR
+function ConvertTo-SafeRow($Row) {
+    $safe = [ordered]@{}
+    foreach ($p in $Row.PSObject.Properties) {
+        $v = $p.Value
+        if ($v -is [string] -and $v -match '^[=+\-@\t\r]') { $v = "'" + $v }
+        $safe[$p.Name] = $v
+    }
+    [pscustomobject]$safe
+}
+
 # ---------------------------------------------------------------------------
 # Collect deny events
 # ---------------------------------------------------------------------------
-$subs   = @(Get-AzSubscription -TenantId $tenantId | Where-Object State -eq 'Enabled')
+$subs   = @(Get-AzSubscription -TenantId $tenant | Where-Object State -eq 'Enabled')
 $events = [System.Collections.Generic.List[object]]::new()
-$failed = [System.Collections.Generic.List[string]]::new()
+$failed = [System.Collections.Generic.List[object]]::new()
 
+Write-Host "Script v$ScriptVersion | Tenant: $tenant | Run by: $runBy"
 Write-Host "Period (UTC): $($start.ToString($fmt)) -> $($end.ToString($fmt))"
-Write-Host "Subscriptions: $($subs.Count) | Granularity: $Granularity`n"
+Write-Host "Subscriptions: $($subs.Count) | Granularity: $Granularity | Mask users: $([bool]$MaskUserCallers)`n"
 
 $flt    = "eventTimestamp ge '$($start.ToString($fmt))' and eventTimestamp le '$($end.ToString($fmt))'"
 $select = "eventTimestamp,operationName,caller,correlationId,resourceGroupName,resourceId,properties"
@@ -140,7 +194,7 @@ foreach ($sub in $subs) {
                     Policies         = (@($pols.policyDefinitionDisplayName | Select-Object -Unique) -join '; ')
                     AssignmentScopes = (@($pols.policyAssignmentScope | Select-Object -Unique) -join '; ')
                     CallerName       = Get-CallerName $e.caller
-                    CallerId         = $e.caller
+                    CallerId         = $(if ($MaskUserCallers -and "$($e.caller)" -like '*@*') { Protect-Caller $e.caller } else { $e.caller })
                     CorrelationId    = $e.correlationId
                 })
             }
@@ -151,7 +205,7 @@ foreach ($sub in $subs) {
         Write-Host ("[{0}/{1}] {2}: {3} deny events" -f $i, $subs.Count, $sub.Name, $count)
     }
     catch {
-        $failed.Add($sub.Name)
+        $failed.Add([pscustomobject]@{ Subscription = $sub.Name; SubscriptionId = $sub.Id; Error = $_.Exception.Message })
         Write-Warning "[$i/$($subs.Count)] $($sub.Name): $($_.Exception.Message)"
     }
     Start-Sleep -Milliseconds 300
@@ -164,7 +218,7 @@ if ($Granularity -eq "Deployment") {
     $out = $events | Group-Object CorrelationId, SubscriptionId | ForEach-Object {
         $g = $_.Group
         [pscustomobject]@{
-            DateTimeBRT      = ($g.DateTimeBRT | Sort-Object)[0]
+            DateTimeBRT      = @($g.DateTimeBRT | Sort-Object)[0]
             Subscription     = $g[0].Subscription
             SubscriptionId   = $g[0].SubscriptionId
             ResourceGroups   = Join-Unique $g.ResourceGroup
@@ -183,21 +237,40 @@ if ($Granularity -eq "Deployment") {
 else {
     $out = $events
 }
-$out = @($out | Sort-Object DateTimeBRT -Descending)
+$out = @($out | Sort-Object DateTimeBRT -Descending | ForEach-Object { ConvertTo-SafeRow $_ })
 
 # ---------------------------------------------------------------------------
-# Save CSV (clouddrive if mounted, otherwise home)
+# Save CSV (UTF-8 with BOM so Excel shows accents correctly) + manifest
 # ---------------------------------------------------------------------------
-$dir      = if (Test-Path "$HOME/clouddrive") { "$HOME/clouddrive" } else { $HOME }
-$fileName = "policy-denies_$($start.ToString('yyyy-MM-dd'))_$($Days)d_$($Granularity.ToLower()).csv"
-$file     = Join-Path $dir $fileName
+$dir = if ($OutputPath) { $OutputPath } elseif (Test-Path "$HOME/clouddrive") { "$HOME/clouddrive" } else { $HOME }
+$baseName = "policy-denies_$($start.ToString('yyyy-MM-dd'))_$($Days)d_$($Granularity.ToLower())"
+$file     = Join-Path $dir "$baseName.csv"
+$manifest = Join-Path $dir "$baseName.manifest.json"
 
 if ($out.Count -gt 0) {
-    $out | Export-Csv $file -NoTypeInformation -Encoding utf8
+    $out | Export-Csv $file -NoTypeInformation -Encoding utf8BOM
 }
 else {
-    "No deny events between $($start.ToString($fmt)) and $($end.ToString($fmt))" | Set-Content $file -Encoding utf8
+    "No deny events between $($start.ToString($fmt)) and $($end.ToString($fmt))" | Set-Content $file -Encoding utf8BOM
 }
+
+[ordered]@{
+    scriptVersion       = $ScriptVersion
+    runAtUtc            = (Get-Date).ToUniversalTime().ToString($fmt)
+    runBy               = $runBy
+    tenantId            = $tenant
+    periodStartUtc      = $start.ToString($fmt)
+    periodEndUtc        = $end.ToString($fmt)
+    granularity         = $Granularity
+    maskedUserCallers   = [bool]$MaskUserCallers
+    subscriptionsTotal  = $subs.Count
+    subscriptionsFailed = @($failed)
+    denyEvents          = $events.Count
+    blockedDeployments  = @($events.CorrelationId | Select-Object -Unique).Count
+    outputRows          = $out.Count
+    csvFile             = (Split-Path $file -Leaf)
+    csvSha256           = (Get-FileHash $file -Algorithm SHA256).Hash
+} | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding utf8
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -213,6 +286,9 @@ if ($events.Count -gt 0) {
     $events | Group-Object CallerName | Sort-Object Count -Descending |
         Select-Object -First 10 -Property Count, Name | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 }
-if ($failed.Count -gt 0) { Write-Warning "Subscriptions with errors: $($failed -join ', ')" }
+if ($failed.Count -gt 0) { Write-Warning "Subscriptions with errors ($($failed.Count)): $($failed.Subscription -join ', ')" }
 
-Write-Host "Saved: $file ($($out.Count) rows)" -ForegroundColor Green
+Write-Host "Saved:    $file ($($out.Count) rows)" -ForegroundColor Green
+Write-Host "Manifest: $manifest" -ForegroundColor Green
+Write-Host "Reminder: the CSV contains internal data. After downloading, remove it from Cloud Shell storage:" -ForegroundColor Yellow
+Write-Host "  Remove-Item '$file', '$manifest'" -ForegroundColor Yellow
