@@ -1,0 +1,218 @@
+<#
+.SYNOPSIS
+  Exports Azure Policy deny events from all subscriptions you can read, using your own Cloud Shell login.
+
+.EXAMPLES
+  ./Export-PolicyDenies.ps1                                  # last 7 full days, one row per blocked deployment
+  ./Export-PolicyDenies.ps1 -Days 30 -Granularity Resource   # last 30 days, one row per blocked resource
+  ./Export-PolicyDenies.ps1 -Days 1 -IncludeToday            # yesterday + today up to now
+#>
+param(
+    [ValidateRange(1, 90)]
+    [int]$Days = 7,
+
+    [ValidateSet("Deployment", "Resource")]
+    [string]$Granularity = "Deployment",
+
+    [switch]$IncludeToday
+)
+
+$ErrorActionPreference = "Stop"
+
+# ---------------------------------------------------------------------------
+# Known service principals (pipelines, automations). Add as you find them:
+#   search the GUID in Entra ID -> Enterprise applications
+# ---------------------------------------------------------------------------
+$knownCallers = @{
+    "f66d954a-dbd2-42ab-a631-81d5eeaf594c" = "hcp-terraform-cloud"
+    # "<app-or-object-id>" = "<name>"
+}
+
+# ---------------------------------------------------------------------------
+# Login / tenant
+# ---------------------------------------------------------------------------
+$ctx = Get-AzContext
+if (-not $ctx) { Connect-AzAccount | Out-Null; $ctx = Get-AzContext }
+$tenantId = $ctx.Tenant.Id
+
+# ---------------------------------------------------------------------------
+# Time window and time zone (Brasília, fixed UTC-3 since 2019)
+# ---------------------------------------------------------------------------
+$fmt   = "yyyy-MM-ddTHH:mm:ssZ"
+$now   = (Get-Date).ToUniversalTime()
+$end   = if ($IncludeToday) { $now } else { $now.Date }
+$start = $now.Date.AddDays(-$Days)
+
+$tz = $null
+foreach ($id in "E. South America Standard Time", "America/Sao_Paulo") {
+    try { $tz = [TimeZoneInfo]::FindSystemTimeZoneById($id); break } catch { }
+}
+if (-not $tz) { $tz = [TimeZoneInfo]::CreateCustomTimeZone("BRT", [TimeSpan]::FromHours(-3), "BRT", "BRT") }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+$script:nameCache = @{}
+
+function Get-ResourceType([string]$ResourceId) {
+    $tail = ($ResourceId -split '/providers/')[-1] -split '/'
+    if ($tail.Count -lt 3) { return $null }
+    $types = for ($i = 1; $i -lt $tail.Count; $i += 2) { $tail[$i] }
+    "$($tail[0])/$($types -join '/')"
+}
+
+function Get-CallerName([string]$Caller) {
+    if ([string]::IsNullOrEmpty($Caller) -or $Caller -like '*@*') { return $Caller }   # users already come as UPN
+    if ($knownCallers.ContainsKey($Caller)) { return $knownCallers[$Caller] }
+    if ($script:nameCache.ContainsKey($Caller)) { return $script:nameCache[$Caller] }
+
+    $name = $null
+    try {
+        $sp = Get-AzADServicePrincipal -ApplicationId $Caller -ErrorAction SilentlyContinue
+        if (-not $sp) { $sp = Get-AzADServicePrincipal -ObjectId $Caller -ErrorAction SilentlyContinue }
+        if ($sp) { $name = $sp.DisplayName }
+    } catch { }
+    if (-not $name) { $name = "(unresolved) $Caller" }
+
+    $script:nameCache[$Caller] = $name
+    $name
+}
+
+# GET with retry for throttling (429) and transient errors
+function Invoke-ArmGet {
+    param([string]$Path, [string]$Uri)
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $resp = if ($Uri) { Invoke-AzRestMethod -Method GET -Uri $Uri } else { Invoke-AzRestMethod -Method GET -Path $Path }
+        if ($resp.StatusCode -eq 200) { return $resp }
+        if ($resp.StatusCode -in 429, 500, 502, 503, 504) {
+            Write-Host "    HTTP $($resp.StatusCode) - retry $attempt in $(10 * $attempt)s" -ForegroundColor Yellow
+            Start-Sleep -Seconds (10 * $attempt)
+            continue
+        }
+        throw "HTTP $($resp.StatusCode): $($resp.Content)"
+    }
+    throw "HTTP $($resp.StatusCode) after 5 attempts"
+}
+
+function Join-Unique($Values) {
+    (@($Values -split '; ' | Where-Object { $_ } | Select-Object -Unique) -join '; ')
+}
+
+# ---------------------------------------------------------------------------
+# Collect deny events
+# ---------------------------------------------------------------------------
+$subs   = @(Get-AzSubscription -TenantId $tenantId | Where-Object State -eq 'Enabled')
+$events = [System.Collections.Generic.List[object]]::new()
+$failed = [System.Collections.Generic.List[string]]::new()
+
+Write-Host "Period (UTC): $($start.ToString($fmt)) -> $($end.ToString($fmt))"
+Write-Host "Subscriptions: $($subs.Count) | Granularity: $Granularity`n"
+
+$flt    = "eventTimestamp ge '$($start.ToString($fmt))' and eventTimestamp le '$($end.ToString($fmt))'"
+$select = "eventTimestamp,operationName,caller,correlationId,resourceGroupName,resourceId,properties"
+$i = 0
+
+foreach ($sub in $subs) {
+    $i++
+    try {
+        $path = "/subscriptions/$($sub.Id)/providers/Microsoft.Insights/eventtypes/management/values" +
+                "?api-version=2015-04-01&`$filter=$([uri]::EscapeDataString($flt))&`$select=$select"
+
+        $count = 0
+        $resp  = Invoke-ArmGet -Path $path
+        while ($true) {
+            $page   = $resp.Content | ConvertFrom-Json
+            $denies = @($page.value | Where-Object { $_.operationName.value -eq 'Microsoft.Authorization/policies/deny/action' })
+
+            foreach ($e in $denies) {
+                $count++
+                $pols = @($e.properties.policies | ConvertFrom-Json)
+                $utc  = ([datetime]$e.eventTimestamp).ToUniversalTime()
+
+                $events.Add([pscustomobject]@{
+                    DateTimeBRT      = [TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz).ToString("yyyy-MM-dd HH:mm:ss")
+                    Subscription     = $sub.Name
+                    SubscriptionId   = $sub.Id
+                    ResourceGroup    = $e.resourceGroupName
+                    Resource         = ($e.resourceId -split '/')[-1]
+                    ResourceType     = Get-ResourceType $e.resourceId
+                    Initiatives      = (@($pols.policySetDefinitionDisplayName | Where-Object { $_ } | Select-Object -Unique) -join '; ')
+                    Policies         = (@($pols.policyDefinitionDisplayName | Select-Object -Unique) -join '; ')
+                    AssignmentScopes = (@($pols.policyAssignmentScope | Select-Object -Unique) -join '; ')
+                    CallerName       = Get-CallerName $e.caller
+                    CallerId         = $e.caller
+                    CorrelationId    = $e.correlationId
+                })
+            }
+
+            if (-not $page.nextLink) { break }
+            $resp = Invoke-ArmGet -Uri $page.nextLink
+        }
+        Write-Host ("[{0}/{1}] {2}: {3} deny events" -f $i, $subs.Count, $sub.Name, $count)
+    }
+    catch {
+        $failed.Add($sub.Name)
+        Write-Warning "[$i/$($subs.Count)] $($sub.Name): $($_.Exception.Message)"
+    }
+    Start-Sleep -Milliseconds 300
+}
+
+# ---------------------------------------------------------------------------
+# Shape output
+# ---------------------------------------------------------------------------
+if ($Granularity -eq "Deployment") {
+    $out = $events | Group-Object CorrelationId, SubscriptionId | ForEach-Object {
+        $g = $_.Group
+        [pscustomobject]@{
+            DateTimeBRT      = ($g.DateTimeBRT | Sort-Object)[0]
+            Subscription     = $g[0].Subscription
+            SubscriptionId   = $g[0].SubscriptionId
+            ResourceGroups   = Join-Unique $g.ResourceGroup
+            BlockedResources = $g.Count
+            Resources        = Join-Unique $g.Resource
+            ResourceTypes    = Join-Unique $g.ResourceType
+            Initiatives      = Join-Unique $g.Initiatives
+            Policies         = Join-Unique $g.Policies
+            AssignmentScopes = Join-Unique $g.AssignmentScopes
+            CallerName       = $g[0].CallerName
+            CallerId         = $g[0].CallerId
+            CorrelationId    = $g[0].CorrelationId
+        }
+    }
+}
+else {
+    $out = $events
+}
+$out = @($out | Sort-Object DateTimeBRT -Descending)
+
+# ---------------------------------------------------------------------------
+# Save CSV (clouddrive if mounted, otherwise home)
+# ---------------------------------------------------------------------------
+$dir      = if (Test-Path "$HOME/clouddrive") { "$HOME/clouddrive" } else { $HOME }
+$fileName = "policy-denies_$($start.ToString('yyyy-MM-dd'))_$($Days)d_$($Granularity.ToLower()).csv"
+$file     = Join-Path $dir $fileName
+
+if ($out.Count -gt 0) {
+    $out | Export-Csv $file -NoTypeInformation -Encoding utf8
+}
+else {
+    "No deny events between $($start.ToString($fmt)) and $($end.ToString($fmt))" | Set-Content $file -Encoding utf8
+}
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+Write-Host "`n===== Summary ====="
+Write-Host "Deny events (blocked resources): $($events.Count)"
+Write-Host "Blocked deployments:             $(@($events.CorrelationId | Select-Object -Unique).Count)"
+if ($events.Count -gt 0) {
+    Write-Host "`nTop policies:"
+    $events | ForEach-Object { $_.Policies -split '; ' } | Group-Object | Sort-Object Count -Descending |
+        Select-Object -First 10 -Property Count, Name | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+    Write-Host "Top callers:"
+    $events | Group-Object CallerName | Sort-Object Count -Descending |
+        Select-Object -First 10 -Property Count, Name | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+}
+if ($failed.Count -gt 0) { Write-Warning "Subscriptions with errors: $($failed -join ', ')" }
+
+Write-Host "Saved: $file ($($out.Count) rows)" -ForegroundColor Green
